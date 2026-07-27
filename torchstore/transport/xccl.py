@@ -94,7 +94,9 @@ def _xccl_factory(
     if device.type == "xpu":
         torch.xpu.set_device(device)
 
-    prefix = f"xccl/{device.type}:{device.index if device.index is not None else 0}/"
+    # Use group_name as prefix so both sides of a cross-node PG see the same
+    # keys regardless of their local device index.
+    prefix = f"xccl/{group_name}/"
     backend_prefix_store = PrefixStore(prefix, store)
 
     options = ProcessGroupXCCL.Options()
@@ -129,10 +131,13 @@ class XcclTransportBuffer(TransportBuffer):
     """Device-resident transport using ProcessGroupXCCL (oneCCL).
 
     Same handshake/send/recv protocol as GlooTransportBuffer but tensors
-    stay on XPU throughout.
+    stay on XPU throughout.  When batch mode is active, all tensors in a
+    get_batch are concatenated into a single flat buffer and transferred
+    with one broadcast -- critical for saturating high-BW fabrics like CXI.
     """
 
     supports_inplace_resharding = False
+    supports_batch_gets = True
 
     def __init__(self, storage_volume_ref: "StorageVolumeRef") -> None:
         super().__init__(storage_volume_ref)
@@ -147,6 +152,8 @@ class XcclTransportBuffer(TransportBuffer):
         self._pg_task: asyncio.Task | None = None
         self._send_task: asyncio.Task | None = None
         self._recv_task: asyncio.Task | None = None
+        # Batch get state: metadata per tensor for split after broadcast
+        self._batch_metas: list[tuple[torch.Size, torch.dtype] | str | None] = []
 
     def requires_handshake(self, requests: list[Request]) -> bool:
         volume_id = self.storage_volume_ref.volume_id
@@ -201,6 +208,7 @@ class XcclTransportBuffer(TransportBuffer):
         state["_pg_task"] = None
         state["_send_task"] = None
         state["_recv_task"] = None
+        state["_batch_metas"] = []
         return state
 
     async def recv_handshake(
@@ -294,28 +302,30 @@ class XcclTransportBuffer(TransportBuffer):
         return [tensor]
 
     async def _pre_get_hook(self, requests: list[Request]) -> None:
-        assert len(requests) == 1
-        request = requests[0]
+        metas = await self.storage_volume_ref.volume.get_meta.call_one(
+            [r.meta_only() for r in requests]
+        )
+        self._batch_metas = []
+        total_bytes = 0
+        for request, meta in zip(requests, metas):
+            if request.tensor_slice is not None:
+                shape = torch.Size(request.tensor_slice.local_shape)
+                dtype = meta[1]
+                self._batch_metas.append((shape, dtype))
+                total_bytes += shape.numel() * torch._utils._element_size(dtype)
+            elif isinstance(meta, str) or meta is None:
+                self._batch_metas.append(meta)
+            else:
+                self._batch_metas.append(meta)
+                total_bytes += meta[0].numel() * torch._utils._element_size(meta[1])
 
-        meta = (
-            await self.storage_volume_ref.volume.get_meta.call_one(
-                [request.meta_only()]
-            )
-        )[0]
+        if total_bytes == 0:
+            self.is_object = True
+            return
 
-        if request.tensor_slice is not None:
-            self.shape = torch.Size(request.tensor_slice.local_shape)
-            self.dtype = meta[1]
-        else:
-            if isinstance(meta, str) or meta is None:
-                self.is_object = True
-                return
-            self.shape = meta[0]
-            self.dtype = meta[1]
-
-        tensor = torch.empty(self.shape, dtype=self.dtype, device=_xpu_device())
+        flat_buf = torch.empty(total_bytes, dtype=torch.uint8, device=_xpu_device())
         self._recv_task = asyncio.create_task(
-            self._receive_tensor(tensor, self.storage_volume_ref.transport_context)
+            self._receive_tensor(flat_buf, self.storage_volume_ref.transport_context)
         )
 
     async def handle_get_request(
@@ -323,13 +333,35 @@ class XcclTransportBuffer(TransportBuffer):
         ctx: "TransportContext",
         entries: list[tuple[Request, Any]],
     ) -> None:
-        assert len(entries) == 1
-        _, data = entries[0]
-        if not isinstance(data, torch.Tensor):
+        # Collect all tensor data, skip non-tensor (object) entries
+        tensors = []
+        total_bytes = 0
+        for _, data in entries:
+            if not isinstance(data, torch.Tensor):
+                continue
+            tensors.append(data)
+            total_bytes += data.numel() * data.element_size()
+
+        if not tensors:
             self.is_object = True
-            self.objects = data
+            if len(entries) == 1:
+                self.objects = entries[0][1]
             return
-        await self._send_tensor(data, ctx)
+
+        target = _xpu_device()
+        flat_buf = torch.empty(total_bytes, dtype=torch.uint8, device=target)
+        offset = 0
+        for t in tensors:
+            t_dev = t.to(target) if t.device != target else t
+            if not t_dev.is_contiguous():
+                t_dev = t_dev.contiguous()
+            nbytes = t_dev.numel() * t_dev.element_size()
+            flat_buf[offset : offset + nbytes].copy_(
+                t_dev.view(-1).view(torch.uint8)
+            )
+            offset += nbytes
+
+        await self._send_tensor(flat_buf, ctx)
 
     async def _handle_storage_volume_response(
         self, requests: list[Request], transport_buffer: "TransportBuffer"
@@ -338,14 +370,26 @@ class XcclTransportBuffer(TransportBuffer):
             return [transport_buffer.objects]
 
         if self._recv_task is not None:
-            tensor = await self._recv_task
+            flat_buf = await self._recv_task
             self._recv_task = None
-            if tensor is None:
+            if flat_buf is None:
                 raise RuntimeError(
-                    f"receive_tensor returned None (is_object={self.is_object}, "
-                    f"shape={self.shape}, dtype={self.dtype})"
+                    f"receive_tensor returned None (is_object={self.is_object})"
                 )
-            return [tensor]
+
+            results = []
+            offset = 0
+            for meta in self._batch_metas:
+                if isinstance(meta, str) or meta is None:
+                    results.append(None)
+                    continue
+                shape, dtype = meta
+                nbytes = shape.numel() * torch._utils._element_size(dtype)
+                tensor = flat_buf[offset : offset + nbytes].view(dtype).reshape(shape)
+                results.append(tensor)
+                offset += nbytes
+            self._batch_metas = []
+            return results
 
         raise RuntimeError(f"No recv task available (is_object={self.is_object})")
 
@@ -357,11 +401,15 @@ class XcclTransportBuffer(TransportBuffer):
             tensor = torch.empty(tensor.shape, dtype=tensor.dtype, device=target)
 
         pg = transport_context.get(XcclProcessGroupCache).get(self.store_key)
-        my_rank = pg.rank()
-        remote_rank = 1 - my_rank
 
         def do_recv():
-            work = pg.recv([tensor], srcRank=remote_rank, tag=0)
+            # Use broadcast instead of p2p recv: oneCCL's OFI transport
+            # does not reliably support point-to-point across nodes.
+            # Sender is rank 1, receiver is rank 0.
+            opts = dist.BroadcastOptions()
+            opts.rootRank = 1
+            opts.rootTensor = 0
+            work = pg.broadcast([tensor], opts)
             work.wait()
             torch.xpu.synchronize(target)
 
@@ -378,11 +426,15 @@ class XcclTransportBuffer(TransportBuffer):
             tensor = tensor.contiguous()
 
         pg = transport_context.get(XcclProcessGroupCache).get(self.store_key)
-        my_rank = pg.rank()
-        remote_rank = 1 - my_rank
 
         def do_send():
-            work = pg.send([tensor], dstRank=remote_rank, tag=0)
+            # Use broadcast instead of p2p send: oneCCL's OFI transport
+            # does not reliably support point-to-point across nodes.
+            # Sender is rank 1, so broadcast from src=1.
+            opts = dist.BroadcastOptions()
+            opts.rootRank = 1
+            opts.rootTensor = 0
+            work = pg.broadcast([tensor], opts)
             work.wait()
             torch.xpu.synchronize(target)
 
