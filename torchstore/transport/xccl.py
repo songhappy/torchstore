@@ -39,6 +39,29 @@ TORCHSTORE_XCCL_ENABLED = os.environ.get("TORCHSTORE_XCCL_ENABLED", "1") == "1"
 TORCHSTORE_XCCL_INIT_TIMEOUT = int(
     os.environ.get("TORCHSTORE_XCCL_INIT_TIMEOUT", "120")
 )
+# Bulk-transfer wait bound. The PG's own timeout covers rendezvous but does not
+# fire on a collective that never completes, so without this a stalled transfer
+# blocks its thread forever and the caller reports nothing. 0 disables the bound.
+TORCHSTORE_XCCL_TRANSFER_TIMEOUT = int(
+    os.environ.get("TORCHSTORE_XCCL_TRANSFER_TIMEOUT", "600")
+)
+
+
+def _wait_with_timeout(work: Any, what: str, store_key: str | None) -> None:
+    """Wait on a collective, raising instead of blocking forever if it stalls."""
+    if TORCHSTORE_XCCL_TRANSFER_TIMEOUT <= 0:
+        work.wait()
+        return
+    timeout = timedelta(seconds=TORCHSTORE_XCCL_TRANSFER_TIMEOUT)
+    try:
+        work.wait(timeout)
+    except Exception as e:
+        raise RuntimeError(
+            f"xccl {what} did not complete within "
+            f"{TORCHSTORE_XCCL_TRANSFER_TIMEOUT}s (store_key={store_key}). "
+            "Raise TORCHSTORE_XCCL_TRANSFER_TIMEOUT if the transfer is merely "
+            "slow, or set it to 0 to wait indefinitely."
+        ) from e
 
 
 def xccl_available() -> bool:
@@ -410,7 +433,7 @@ class XcclTransportBuffer(TransportBuffer):
             opts.rootRank = 1
             opts.rootTensor = 0
             work = pg.broadcast([tensor], opts)
-            work.wait()
+            _wait_with_timeout(work, "recv broadcast", self.store_key)
             torch.xpu.synchronize(target)
 
         await asyncio.to_thread(do_recv)
@@ -435,7 +458,7 @@ class XcclTransportBuffer(TransportBuffer):
             opts.rootRank = 1
             opts.rootTensor = 0
             work = pg.broadcast([tensor], opts)
-            work.wait()
+            _wait_with_timeout(work, "send broadcast", self.store_key)
             torch.xpu.synchronize(target)
 
         await asyncio.to_thread(do_send)
