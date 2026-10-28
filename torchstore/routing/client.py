@@ -20,13 +20,25 @@ from torchstore.state_dict_utils import _state_dict_storage_metadata, DELIM, MAP
 from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport import create_transport_buffer
 from torchstore.transport.types import Request
+from torchstore.transport.xccl import xccl_available
 from torchstore.utils import same_slice_geometry
 from ._model import KeyRegistration, RankRole
 from .coordinator import RoutingCoordinator
 from .directory import RoutingDirectory
-from .plan import RoutingPlan
+from .plan import Balance, RoutingPlan
 
 __all__ = ["RoutingClient"]
+
+
+def _requester_balance() -> Balance:
+    """How a requester picks among replicas of the same data.
+
+    XCCL keeps one communicator per (requester, volume) pair and oneCCL caps the
+    communicators of a process (128), so each requester reads from one replica:
+    with 8 trainer replicas of 12 shards and 96 generators, a volume serves 12
+    generators instead of 96. Other transports spread keys over replicas.
+    """
+    return Balance.REQUESTER if xccl_available() else Balance.ROTATE
 
 
 class RoutingClient(LocalClient):
@@ -117,7 +129,9 @@ class RoutingClient(LocalClient):
         }
         rank = self._routing_directory.rank
         self._routing_directory.install(
-            RoutingPlan.for_requester(rank, registrations, publishers)
+            RoutingPlan.for_requester(
+                rank, registrations, publishers, balance=_requester_balance()
+            )
         )
         self._registered_layouts.add(key)
 

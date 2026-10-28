@@ -47,6 +47,9 @@ class Balance(str, Enum):
 
     # A pure function of the key, so every local planner makes the same choice.
     ROTATE = "rotate"
+    # A pure function of the requester rank: each requester reads every key from
+    # the one replica at its position, so it reaches only that replica's volumes.
+    REQUESTER = "requester"
 
 
 class _Rotate:
@@ -61,7 +64,33 @@ class _Rotate:
         return candidates[(zlib.crc32(key.encode()) + index) % len(candidates)]
 
 
-_BALANCERS = {Balance.ROTATE: _Rotate}
+def _rank_ordinal(rank: str) -> tuple[int, ...]:
+    """The integers of a rank path, e.g. ``"requester/7/0"`` -> ``(7, 0)``."""
+    return tuple(int(part) for part in rank.split("/") if part.isdigit())
+
+
+class _ByRequester:
+    """Hands every choice of one requester to the replica at its position.
+
+    Candidates are ordered by rank number, not as strings, so position ``i`` is
+    the same replica for every slice: ``publisher/2`` then ``publisher/14`` for
+    the slice that replicas 0 and 1 hold at ``publisher/2`` and ``publisher/14``.
+    A transport with one communicator per (requester, volume) pair, such as XCCL,
+    then keeps a volume's communicators to the requesters of its replica instead
+    of every requester.
+    """
+
+    def __init__(self, requester: str) -> None:
+        self.position = sum(_rank_ordinal(requester))
+
+    def choose(
+        self,
+        key: str,
+        index: int,
+        candidates: Sequence[str],
+    ) -> str:
+        ordered = sorted(candidates, key=_rank_ordinal)
+        return ordered[self.position % len(ordered)]
 
 
 def _geometry_slice(geometry: _GeometryKey) -> TensorSlice:
@@ -122,7 +151,7 @@ class _Builder:
         self.rank = rank
         self.registrations = registrations
         self.publishers = publishers
-        self.balance = _BALANCERS[balance]()
+        self.balance = _ByRequester(rank) if balance == Balance.REQUESTER else _Rotate()
         # storage_key -> wire dtype
         self.dtypes: dict[str, torch.dtype] = {}
         # storage_key -> [(published slice, ranks holding it)], in geometry order
