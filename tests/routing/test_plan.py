@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 import torch
 from torchstore.routing._model import KeyRegistration
-from torchstore.routing.plan import RoutingPlan
+from torchstore.routing.plan import Balance, RoutingPlan
 
 from .utils import tensor_slice
 
@@ -130,3 +130,63 @@ def test_accepts_a_zero_sized_requester_shard() -> None:
     assert route is not None
     assert route.destination_slice is empty
     assert route.transfers == ()
+
+
+def test_requester_balance_reads_every_key_from_one_replica() -> None:
+    """Under REQUESTER each requester reaches one replica's volumes, and the
+    requesters split evenly over the replicas."""
+    num_replicas, num_shards, num_requesters = 8, 12, 96
+    rows = 2 * num_shards
+    publishers = {}
+    for replica in range(num_replicas):
+        for shard in range(num_shards):
+            shard_slice = tensor_slice((2 * shard, 0), (2, 6), global_shape=(rows, 6))
+            publishers[f"publisher/{replica * num_shards + shard}"] = {
+                key: KeyRegistration(shard_slice, dtype=torch.float32)
+                for key in ("wq", "wk", "wo")
+            }
+    whole = tensor_slice((0, 0), (rows, 6), global_shape=(rows, 6))
+    wanted = {
+        key: KeyRegistration(whole, dtype=torch.float32) for key in ("wq", "wk", "wo")
+    }
+
+    requesters_per_volume: dict[str, int] = {}
+    for requester in range(num_requesters):
+        plan = RoutingPlan.for_requester(
+            f"requester/{requester}/0", wanted, publishers, balance=Balance.REQUESTER
+        )
+        sources = {
+            transfer.source
+            for key in wanted
+            for transfer in plan.routes.lookup(key).transfers
+        }
+        replica = requester % num_replicas
+        assert sources == {
+            f"publisher/{replica * num_shards + shard}" for shard in range(num_shards)
+        }
+        for source in sources:
+            requesters_per_volume[source] = requesters_per_volume.get(source, 0) + 1
+
+    assert set(requesters_per_volume.values()) == {num_requesters // num_replicas}
+
+
+def test_rotate_balance_spreads_one_requester_over_replicas() -> None:
+    """ROTATE (the default) picks by key, so one requester reaches several replicas."""
+    publishers = {
+        f"publisher/{replica}": {
+            key: KeyRegistration(
+                tensor_slice((0,), (8,), global_shape=(8,)), dtype=torch.float32
+            )
+            for key in ("wq", "wk", "wv", "wo")
+        }
+        for replica in range(4)
+    }
+    wanted = {
+        key: KeyRegistration(
+            tensor_slice((0,), (8,), global_shape=(8,)), dtype=torch.float32
+        )
+        for key in ("wq", "wk", "wv", "wo")
+    }
+    plan = RoutingPlan.for_requester("requester/0/0", wanted, publishers)
+    sources = {plan.routes.lookup(key).transfers[0].source for key in wanted}
+    assert len(sources) > 1
