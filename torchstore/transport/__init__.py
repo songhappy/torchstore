@@ -89,7 +89,8 @@ def _log_transport_resolution(
     storage_volume_ref: "StorageVolumeRef", transport_type: TransportType
 ) -> None:
     logger.info(
-        "[ts-transport] resolved=%s (torch_distributed=%s, nixl=%s, uniflow=%s, tc_rdma=%s, monarch_rdma=%s, xccl=%s, gloo=%s, shm=%s)",
+        "[ts-transport] resolved=%s (torch_distributed=%s, nixl=%s, uniflow=%s, tc_rdma=%s, "
+        "monarch_rdma=%s, xccl=%s, gloo=%s, shm=%s)",
         transport_type.name,
         torch_transport_available(),
         nixl_available(),
