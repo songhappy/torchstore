@@ -49,10 +49,11 @@ class TransportType(Enum):
     TorchComms = auto()
     TorchCommsRDMA = TorchComms  # Backward compatible alias
     Gloo = auto()
-    XCCL = auto()  # Intel oneCCL via torch.distributed; device-resident on XPU
     SharedMemory = auto()  # POSIX shared memory for same-host transfers
     NIXL = auto()
     TorchDistributed = auto()  # torch.distributed._transport backends
+    # Appended so the values above keep their numbers.
+    XCCL = auto()  # Intel oneCCL via torch.distributed; device-resident on XPU
 
 
 def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> TransportType:
