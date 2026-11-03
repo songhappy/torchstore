@@ -290,8 +290,8 @@ class XcclTransportBuffer(TransportBuffer):
         self._pg_task = asyncio.create_task(asyncio.to_thread(create_pg))
 
     def __getstate__(self) -> dict[str, Any]:
-        state = self.__dict__.copy()
-        state["storage_volume_ref"] = None
+        """Serialize state, excluding non-serializable fields."""
+        state = super().__getstate__()
         state["_tcp_store"] = None
         state["_pg_task"] = None
         state["_send_task"] = None
